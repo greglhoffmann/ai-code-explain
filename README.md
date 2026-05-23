@@ -16,13 +16,14 @@ A terminal-based code analysis tool combining **deterministic static analysis** 
 ││ History│├───────────────────────────────┤│       │
 ││ Sidebar││ Analysis Tabs:                ││       │
 ││        ││  Explanation │ Complexity     ││       │
-││        ││  Semgrep     │ Diff           ││       │
+││        ││  Semgrep     │ Optimizations  ││       │
+││        ││  Diff (side-by-side/unified)  ││       │
 │└────────┘└───────────────────────────────┘│       │
 └───────┬───────────────────────────────────┘       │
         │                                           │
         │ paste / edit snippet                      │ reads file from disk
         │ language: heuristic                       │ language: extension → heuristic
-        │ sandbox: LOCAL_CONTEXT_SANDBOX_DIR                  │ sandbox: file's parent directory
+        │ sandbox: LOCAL_CONTEXT_SANDBOX_DIR        │ sandbox: file's parent directory
         │                                           │
         └──────────────┬────────────────────────────┘
                        │
@@ -30,10 +31,10 @@ A terminal-based code analysis tool combining **deterministic static analysis** 
                        │
               Step 1: AST complexity + metadata
                        │
-                       ├──────────────┬───────────────┐
-                       │              │               │
-                       ▼              ▼               ▼
-          Semgrep (2a) ─── Local FS Context (2b)   Complexity LLM (2c)
+                       ├──────────────┬──────────────────┐
+                       │              │                  │
+                       ▼              ▼                  ▼
+               Semgrep (2a) ─── Local FS Context (2b)   Complexity LLM (2c)
                        │              │                
                        │              │
                        ▼              │
@@ -58,8 +59,8 @@ The tool has two distinct modes of operation — both run the same analysis pipe
 
 | Mode | Command | Use when |
 |---|---|---|
-| **Interactive TUI** | `code-explain` | You want a persistent session — browse history, paste or edit snippets inline, navigate results across four tabs with keyboard shortcuts. Snippet history is saved to SQLite. Language is auto-detected from content heuristics (no file path available). |
-| **CLI / non-interactive** | `code-explain --analyze FILE` | You want to analyze a file on disk and print results to stdout — scriptable, CI-friendly. Language is inferred from the file extension first (`.py` → Python, `.js`/`.ts`/`.mjs` → JavaScript), falling back to heuristics. The sandbox for local-import resolution is automatically set to the file's parent directory. |
+| **Interactive TUI** | `code-explain` | You want a persistent session — browse history, paste or edit snippets inline, navigate results across five tabs with keyboard shortcuts. Snippet history is saved to SQLite. Language is auto-detected from content heuristics (no file path available). |
+| **CLI / non-interactive** | `code-explain --analyze FILE` | You want to analyze a file on disk and print results to stdout — scriptable, CI-friendly. Language is inferred from the file extension first (`.py` → Python, `.js`/`.mjs`/`.cjs`/`.ts`/`.jsx`/`.tsx` → JavaScript), falling back to heuristics. The sandbox for local-import resolution is automatically set to the file's parent directory. |
 
 Both modes persist results to the same SQLite history database.
 
@@ -72,11 +73,11 @@ Both modes persist results to the same SQLite history database.
 3. **Static AST analysis** — loops, nesting, recursion, comprehensions, sorts, imports, hotspot spans
 4. **DAG fan-out (parallel)** — Semgrep runs for deterministic findings, in-process local filesystem context lookup runs for local-import context, and the complexity LLM call starts immediately from source + static metadata.
 5. **DAG dependent LLM stages** — optimization waits for Semgrep findings, and explanation is grounded by local filesystem context + Semgrep findings.
-6. **Mandatory optimized-code syntax check** — deterministic parse validation runs on the LLM-optimized output; failures are surfaced as user-visible warnings.
-7. **Optional block-level complexity** — per-hotspot LLM complexity parallelization (when enabled)
-8. **Diff generation** — `difflib` unified diff (original → optimized); regenerated on history reload from stored `original_code` + `optimized_code`
-9. **Persistence** — static and LLM complexity stored separately in SQLite; diff is regenerated on load
-10. **UI rendering** — Explanation, Complexity, Semgrep, Diff tabs (all scrollable) with hotspot highlighting/navigation
+6. **Optional block-level complexity** — per-hotspot LLM complexity parallelization (when enabled)
+7. **Mandatory optimized-code syntax check** — deterministic parse validation runs on the LLM-optimized output; failures are surfaced as user-visible warnings.
+8. **Diff generation** — deterministic diff views are generated from original + optimized output (`difflib` unified markup plus side-by-side row-aligned rendering in TUI)
+9. **Persistence** — static and LLM complexity stored separately in SQLite; optimization warnings are stored with LLM complexity payload
+10. **UI rendering** — Explanation, Complexity, Semgrep, Optimizations, and Diff tabs (scrollable) with hotspot highlighting/navigation
 
 ---
 
@@ -102,6 +103,7 @@ The runtime uses dependency-aware parallelism, not a single all-independent fan-
 - After static analysis: Semgrep, local filesystem context lookup, and complexity LLM start in parallel.
 - Optimization LLM starts after Semgrep completes (it depends on findings).
 - Explanation LLM starts after Semgrep and local filesystem context complete.
+- Optional block-level LLM complexity runs after the core three LLM stages complete.
 - This shortens wall-clock time by overlapping independent work while preserving required data dependencies.
 
 In code, this is orchestrated with a `ThreadPoolExecutor` in `run_pipeline` and explicit future joins at each dependency boundary.
@@ -138,6 +140,22 @@ JSON-only response format is enforced (`response_format: json_object`) for all t
 
 ---
 
+### Semgrep Integration
+
+Semgrep runs **before** the optimization and explanation LLMs call, ensuring findings are available as grounding context.
+
+**Detected patterns depend on Semgrep's `auto` ruleset and language parser support**, typically including security findings and code-quality/performance smells where matching rules exist.
+
+Semgrep is invoked as a subprocess with a temporary file — `shell=True` is **never** used.
+
+Findings are stored in `semgrep_findings_json` and rendered in the **Semgrep** tab. They are also included in the optimization and explanation prompts so the LLM can reference specific rule violations.
+
+Semgrep uses tree-sitter for parsing, which has partial error recovery. For **severely broken syntax** (missing colons, mismatched parentheses, etc.), Semgrep may produce no findings or fewer findings because it cannot reliably identify code structures to apply rules to. This is **expected behavior**.
+
+When Semgrep returns a parse error (exit code 4) or stderr output on an empty result set, an informational `semgrep-parse-warning` finding is shown in the Semgrep tab so you know the analysis ran but was impaired.
+
+---
+
 ### Local Filesystem Context Security Constraints
 
 The local filesystem context integration is **sandboxed** and **read-only**. It is implemented directly in this process (no external server call):
@@ -163,25 +181,6 @@ The local filesystem context integration is **sandboxed** and **read-only**. It 
 
 ---
 
-### Semgrep Integration
-
-Semgrep runs **before** the LLM call, ensuring findings are available as grounding context.
-
-**Detected patterns include:**
-- Nested loop inefficiencies
-- Repeated list membership checks
-- Unsafe patterns
-- Anti-patterns
-- Performance smells
-
-Semgrep is invoked as a subprocess with a temporary file — `shell=True` is **never** used.
-
-Findings are stored in `semgrep_findings_json` and rendered in the **Semgrep** tab. They are also included in the optimization and explanation prompts so the LLM can reference specific rule violations.
-
-Semgrep uses tree-sitter for parsing, which has partial error recovery. For **severely broken syntax** (missing colons, mismatched parentheses, etc.), Semgrep may produce no findings or fewer findings because it cannot reliably identify code structures to apply rules to. This is **expected behavior**.
-
-When Semgrep returns a parse error (exit code 4) or stderr output on an empty result set, an informational `semgrep-parse-warning` finding is shown in the Semgrep tab so you know the analysis ran but was impaired.
-
 ### Optimized Output Syntax Validation
 
 Optimized code is always syntax-checked in a deterministic stage before final output:
@@ -197,10 +196,11 @@ If validation fails, the run continues, but a warning is surfaced in both CLI ou
 
 LLM responses are requested in **markdown format** and rendered with Textual's `Markdown` widget:
 
-- **Explanation tab** — bulleted *Key Behaviors* and *Risks / Issues* sections
+- **Explanation tab** — 2-4 sentence summary, bulleted *Key Behaviors* and *Risks / Issues* sections
 - **Complexity tab** — bullet-list reasoning for the complexity estimate
 - **Semgrep tab** — severity-tagged Semgrep rules with line numbers and optimization/sandbox warnings
-- **Diff tab** — split original vs optimized panes with changed-line background highlighting
+- **Optimizations tab** — canonical optimized source plus structured per-improvement details (description, tradeoffs, and optional variant snippets)
+- **Diff tab** — toggleable side-by-side and unified views (`Ctrl+D`) with changed-line background highlighting
 
 The code viewer uses a read-only `TextArea`, so text remains selectable after analysis. Clicking a hotspot creates an actual selection range in the viewer, which highlights the span with a background color.
 
@@ -313,14 +313,16 @@ Open a new terminal after adding to PATH, then verify with `code-explain --help`
 | `Ctrl+S` | Submit snippet for analysis (in editor) |
 | `Escape` | Cancel editor |
 | `Ctrl+R` | Re-run analysis on current snippet |
-| `Ctrl+E` | Export optimized code to `.ai_code_explain_exports/` |
+| `Ctrl+E` | Export optimized code to `.code_explain_exports/` |
 | `Ctrl+T` | Toggle model: fast (Laguna M.1) ↔ reasoning (Nemotron 3 Super) |
 | `Ctrl+Y` | Toggle analysis mode: concise ↔ detailed |
 | `Ctrl+B` | Toggle block-level LLM complexity (may significantly increase runtime) |
+| `Ctrl+D` | Cycle Diff view: side-by-side ↔ unified |
 | `1` | Switch to Explanation tab |
 | `2` | Switch to Complexity tab |
 | `3` | Switch to Semgrep tab |
-| `4` | Switch to Diff tab |
+| `4` | Switch to Optimizations tab |
+| `5` | Switch to Diff tab |
 | `Tab` / `Shift+Tab` | Move focus between panes |
 | `Enter` | Select history item / hotspot |
 | `Ctrl+Q` | Quit |
@@ -392,7 +394,7 @@ pytest tests/test_python_analyzer.py -v
 
 ### Coverage Requirements
 
-The suite is configured to **fail if coverage drops below 90%** (`--cov-fail-under=90`). UI code (`src/ai_code_explain/ui/*`) is excluded from coverage measurement because Textual widgets require a running event loop.
+The suite is configured to **fail if coverage drops below 90%** (`--cov-fail-under=90`). UI code (`src/ai_code_explain/ui/*`) is excluded from coverage measurement because Textual widgets require a running event loop, and `src/ai_code_explain/main.py` is also excluded as a thin CLI entrypoint wrapper.
 
 ### Test Modules
 
