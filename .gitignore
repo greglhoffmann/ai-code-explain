@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.code_explain_exports/
+.coverage
+*.db
+.DS_Store
+.github\plan.instructions.md
+tool_rationale.md
